@@ -1,0 +1,208 @@
+package mq
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/servercfg"
+	"golang.org/x/exp/slog"
+)
+
+// KEEPALIVE_TIMEOUT - time in seconds for timeout
+const KEEPALIVE_TIMEOUT = 60 //timeout in seconds
+// MQ_DISCONNECT - disconnects MQ
+const MQ_DISCONNECT = 250
+
+// MQ_TIMEOUT - timeout for MQ
+const MQ_TIMEOUT = 30
+
+var peer_force_send = 0
+
+var mqclient mqtt.Client
+
+func setMqOptions(user, password string, opts *mqtt.ClientOptions) {
+	broker, _ := servercfg.GetMessageQueueEndpoint()
+	opts.AddBroker(broker)
+	opts.ClientID = logic.RandomString(23)
+	opts.SetUsername(user)
+	opts.SetPassword(password)
+	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
+	opts.SetCleanSession(true)
+	opts.SetConnectRetryInterval(time.Second * 1)
+	opts.SetKeepAlive(time.Second * 15)
+	opts.SetOrderMatters(false)
+	opts.SetWriteTimeout(time.Minute)
+}
+
+// SetupMQTT creates a connection to broker and return client
+func SetupMQTT(fatal bool) {
+	if servercfg.GetBrokerType() == servercfg.EmqxBrokerType {
+		if emqx.GetType() == servercfg.EmqxOnPremDeploy {
+			time.Sleep(10 * time.Second) // wait for the REST endpoint to be ready
+			// setup authenticator and create admin user
+			if err := emqx.CreateEmqxDefaultAuthenticator(); err != nil {
+				logger.Log(0, err.Error())
+			}
+			emqx.DeleteEmqxUser(servercfg.GetMqUserName())
+			if err := emqx.CreateEmqxUserforServer(); err != nil {
+				log.Fatal(err)
+			}
+			// create an ACL authorization source for the built in EMQX MNESIA database
+			if err := emqx.CreateEmqxDefaultAuthorizer(); err != nil {
+				logger.Log(0, err.Error())
+			}
+			// create a default deny ACL to all topics for all users
+			if err := emqx.CreateDefaultAllowRule(); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			emqx.DeleteEmqxUser(servercfg.GetMqUserName())
+			if err := emqx.CreateEmqxUserforServer(); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
+
+	opts := mqtt.NewClientOptions()
+	setMqOptions(servercfg.GetMqUserName(), servercfg.GetMqPassword(), opts)
+	logger.Log(0, "Mq Client Connecting with Random ID: ", opts.ClientID)
+	opts.SetOnConnectHandler(func(client mqtt.Client) {
+		// Only master pod subscribes to incoming client messages in HA setup
+		// This prevents duplicate message processing across multiple pods
+		// Worker pods can still publish messages but won't process incoming ones
+		serverName := servercfg.GetServer()
+		if servercfg.IsMasterPod() {
+			if token := client.Subscribe(fmt.Sprintf("update/%s/#", serverName), 0, mqtt.MessageHandler(UpdateNode)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "node update subscription failed")
+			}
+			if token := client.Subscribe(fmt.Sprintf("host/serverupdate/%s/#", serverName), 0, mqtt.MessageHandler(UpdateHost)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "host update subscription failed")
+			}
+			if token := client.Subscribe(fmt.Sprintf("signal/%s/#", serverName), 0, mqtt.MessageHandler(ClientPeerUpdate)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "node client subscription failed")
+			}
+			if token := client.Subscribe(fmt.Sprintf("metrics/%s/#", serverName), 0, mqtt.MessageHandler(UpdateMetrics)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "node metrics subscription failed")
+			}
+			if token := client.Subscribe(fmt.Sprintf("integration/%s/pull", serverName), 0, mqtt.MessageHandler(HandleExporterIntegrationPull)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "exporter integration pull subscription failed")
+			}
+			logger.Log(0, "MQ subscriptions established (master pod)")
+		} else {
+			logger.Log(0, "MQ publish-only mode (worker pod)")
+		}
+		if servercfg.IsHA() {
+			if token := client.Subscribe(fmt.Sprintf("serversync/%s", serverName), 0, mqtt.MessageHandler(handleServerSync)); token.WaitTimeout(MQ_TIMEOUT*time.Second) && token.Error() != nil {
+				logger.Log(0, "server sync subscription failed")
+			}
+		}
+
+		opts.SetOrderMatters(false)
+		opts.SetResumeSubs(true)
+	})
+	opts.SetConnectionLostHandler(func(c mqtt.Client, e error) {
+		slog.Warn("detected broker connection lost, auto-reconnect will retry", "err", e.Error())
+	})
+	mqclient = mqtt.NewClient(opts)
+	tperiod := time.Now().Add(10 * time.Second)
+	for {
+		if token := mqclient.Connect(); !token.WaitTimeout(MQ_TIMEOUT*time.Second) || token.Error() != nil {
+			logger.Log(2, "unable to connect to broker, retrying ...")
+			if time.Now().After(tperiod) {
+				if token.Error() == nil {
+					if fatal {
+						logger.FatalLog("could not connect to broker, token timeout, exiting ...")
+					}
+					logger.Log(0, "could not connect to broker, token timeout, exiting ...")
+
+				} else {
+					if fatal {
+						logger.FatalLog("could not connect to broker, exiting ...", token.Error().Error())
+					}
+					logger.Log(0, "could not connect to broker, exiting ...", token.Error().Error())
+				}
+			}
+		} else {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	InitServerSync()
+}
+
+const CHECKIN_FLUSH_INTERVAL = 30
+
+// normalizedMetricsExportInterval applies the same minimum as before (invalid/too-small
+// intervals use a 10-minute default).
+func normalizedMetricsExportInterval() time.Duration {
+	d := logic.GetMetricIntervalInMinutes()
+	if d < time.Minute {
+		return time.Minute * 10
+	}
+	return d
+}
+
+// Keepalive -- periodically pings all nodes to let them know server is still alive and doing well
+func Keepalive(ctx context.Context) {
+	warmPeerCaches()
+	StartPeerUpdateWorker(ctx)
+	go PublishPeerUpdate(true)
+	metricIntervalReset := logic.SubscribeMetricExportIntervalReset()
+	metricsTicker := time.NewTicker(normalizedMetricsExportInterval())
+	defer metricsTicker.Stop()
+	if servercfg.CacheEnabled() {
+		checkinTicker := time.NewTicker(CHECKIN_FLUSH_INTERVAL * time.Second)
+		defer checkinTicker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				logic.FlushNodeCheckins()
+				return
+			case <-time.After(time.Second * KEEPALIVE_TIMEOUT):
+				sendPeers()
+			case <-checkinTicker.C:
+				logic.FlushNodeCheckins()
+			case <-metricsTicker.C:
+				PushAllMetricsToExporter()
+			case <-metricIntervalReset:
+				metricsTicker.Stop()
+				metricsTicker = time.NewTicker(normalizedMetricsExportInterval())
+			}
+		}
+	} else {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second * KEEPALIVE_TIMEOUT):
+				sendPeers()
+			case <-metricsTicker.C:
+				PushAllMetricsToExporter()
+			case <-metricIntervalReset:
+				metricsTicker.Stop()
+				metricsTicker = time.NewTicker(normalizedMetricsExportInterval())
+			}
+		}
+	}
+}
+
+// IsConnected - function for determining if the mqclient is connected or not
+func IsConnected() bool {
+	return mqclient != nil && mqclient.IsConnected()
+}
+
+// IsConnectionOpen - function for determining if the mqclient is connected or not
+func IsConnectionOpen() bool {
+	return mqclient != nil && mqclient.IsConnectionOpen()
+}
+
+// CloseClient - function to close the mq connection from server
+func CloseClient() {
+	mqclient.Disconnect(250)
+}

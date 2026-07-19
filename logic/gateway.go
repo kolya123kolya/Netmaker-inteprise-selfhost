@@ -1,0 +1,387 @@
+package logic
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"slices"
+	"sort"
+	"time"
+
+	"context"
+
+	"github.com/gravitl/netmaker/db"
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/schema"
+	"golang.org/x/exp/slog"
+	"gorm.io/gorm"
+)
+
+var (
+	IPv4Network = "0.0.0.0/0"
+	IPv6Network = "::/0"
+)
+
+// IsInternetGw - checks if node is acting as internet gw
+func IsInternetGw(node models.Node) bool {
+	return node.IsInternetGateway
+}
+
+// CreateEgressGateway - creates an egress gateway
+func CreateEgressGateway(gateway models.EgressGatewayRequest) (models.Node, error) {
+	node, err := GetNodeByID(gateway.NodeID)
+	if err != nil {
+		return models.Node{}, err
+	}
+	host := &schema.Host{
+		ID: node.HostID,
+	}
+	err = host.Get(db.WithContext(context.TODO()))
+	if err != nil {
+		return models.Node{}, err
+	}
+	if host.OS != "linux" { // support for other OS to be added
+		return models.Node{}, errors.New(host.OS + " is unsupported for egress gateways")
+	}
+	if host.FirewallInUse == schema.FIREWALL_NONE {
+		return models.Node{}, errors.New("please install iptables or nftables on the device")
+	}
+	if len(gateway.RangesWithMetric) == 0 && len(gateway.Ranges) > 0 {
+		for _, rangeI := range gateway.Ranges {
+			gateway.RangesWithMetric = append(gateway.RangesWithMetric, models.EgressRangeMetric{
+				Network:     rangeI,
+				RouteMetric: 256,
+			})
+		}
+	}
+	for i := len(gateway.Ranges) - 1; i >= 0; i-- {
+		// check if internet gateway IPv4
+		if gateway.Ranges[i] == "0.0.0.0/0" || gateway.Ranges[i] == "::/0" {
+			// remove inet range
+			gateway.Ranges = append(gateway.Ranges[:i], gateway.Ranges[i+1:]...)
+			continue
+		}
+		normalized, err := NormalizeCIDR(gateway.Ranges[i])
+		if err != nil {
+			return models.Node{}, err
+		}
+		gateway.Ranges[i] = normalized
+
+	}
+	rangesWithMetric := []string{}
+	for i := len(gateway.RangesWithMetric) - 1; i >= 0; i-- {
+		if gateway.RangesWithMetric[i].Network == "0.0.0.0/0" || gateway.RangesWithMetric[i].Network == "::/0" {
+			// remove inet range
+			gateway.RangesWithMetric = append(gateway.RangesWithMetric[:i], gateway.RangesWithMetric[i+1:]...)
+			continue
+		}
+		normalized, err := NormalizeCIDR(gateway.RangesWithMetric[i].Network)
+		if err != nil {
+			return models.Node{}, err
+		}
+		gateway.RangesWithMetric[i].Network = normalized
+		rangesWithMetric = append(rangesWithMetric, gateway.RangesWithMetric[i].Network)
+		if gateway.RangesWithMetric[i].RouteMetric <= 0 || gateway.RangesWithMetric[i].RouteMetric > 999 {
+			gateway.RangesWithMetric[i].RouteMetric = 256
+		}
+	}
+	sort.Strings(gateway.Ranges)
+	sort.Strings(rangesWithMetric)
+	if !slices.Equal(gateway.Ranges, rangesWithMetric) {
+		return models.Node{}, errors.New("invalid ranges")
+	}
+	if gateway.NatEnabled == "" {
+		gateway.NatEnabled = "yes"
+	}
+	err = ValidateEgressGateway(gateway)
+	if err != nil {
+		return models.Node{}, err
+	}
+	if gateway.Ranges == nil {
+		gateway.Ranges = make([]string, 0)
+	}
+	node.EgressDetails.IsEgressGateway = true
+	node.EgressDetails.EgressGatewayRanges = gateway.Ranges
+	node.EgressDetails.EgressGatewayNatEnabled = models.ParseBool(gateway.NatEnabled)
+
+	node.EgressDetails.EgressGatewayRequest = gateway // store entire request for use when preserving the egress gateway
+	node.SetLastModified()
+	if err = UpsertNode(&node); err != nil {
+		return models.Node{}, err
+	}
+	return node, nil
+}
+
+// ValidateEgressGateway - validates the egress gateway model
+func ValidateEgressGateway(gateway models.EgressGatewayRequest) error {
+	return nil
+}
+
+// DeleteEgressGateway - deletes egress from node
+func DeleteEgressGateway(network, nodeid string) (models.Node, error) {
+	node, err := GetNodeByID(nodeid)
+	if err != nil {
+		return models.Node{}, err
+	}
+	node.EgressDetails.IsEgressGateway = false
+	node.EgressDetails.EgressGatewayRanges = []string{}
+	node.EgressDetails.EgressGatewayRequest = models.EgressGatewayRequest{} // remove preserved request as the egress gateway is gone
+	node.SetLastModified()
+	if err = UpsertNode(&node); err != nil {
+		return models.Node{}, err
+	}
+	return node, nil
+}
+
+// GetIngressGwUsers - lists the users having to access to ingressGW
+func GetIngressGwUsers(node models.Node) (models.IngressGwUsers, error) {
+
+	gwUsers := models.IngressGwUsers{
+		NodeID:  node.ID.String(),
+		Network: node.Network,
+	}
+	users, err := GetUsers()
+	if err != nil {
+		return gwUsers, err
+	}
+	for _, user := range users {
+		if user.PlatformRoleID != schema.SuperAdminRole && user.PlatformRoleID != schema.AdminRole {
+			gwUsers.Users = append(gwUsers.Users, user)
+		}
+	}
+	return gwUsers, nil
+}
+
+// DeleteIngressGateway - deletes an ingress gateway
+func DeleteIngressGateway(nodeid string) (models.Node, []models.ExtClient, error) {
+	removedClients := []models.ExtClient{}
+	node, err := GetNodeByID(nodeid)
+	if err != nil {
+		return models.Node{}, removedClients, err
+	}
+	clients, err := GetExtClientsByID(nodeid, node.Network)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return models.Node{}, removedClients, err
+	}
+
+	removedClients = clients
+
+	// delete ext clients belonging to ingress gateway
+	if err = DeleteGatewayExtClients(node.ID.String(), node.Network); err != nil {
+		return models.Node{}, removedClients, err
+	}
+	logger.Log(3, "deleting ingress gateway")
+	node.LastModified = time.Now().UTC()
+	node.IsIngressGateway = false
+	delete(node.Tags, models.TagID(fmt.Sprintf("%s.%s", node.Network, models.GwTagName)))
+	node.IngressGatewayRange = ""
+	node.Metadata = ""
+	err = UpsertNode(&node)
+	if err != nil {
+		return models.Node{}, removedClients, err
+	}
+	err = SetNetworkNodesLastModified(node.Network)
+	return node, removedClients, err
+}
+
+// DeleteGatewayExtClients - deletes ext clients based on gateway (mac) of ingress node and network
+func DeleteGatewayExtClients(gatewayID string, networkName string) error {
+	currentExtClients, err := GetNetworkExtClients(networkName)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, extClient := range currentExtClients {
+		if extClient.IngressGatewayID == gatewayID {
+			if err = DeleteExtClient(networkName, extClient.ClientID, false); err != nil {
+				logger.Log(1, "failed to remove ext client", extClient.ClientID)
+				continue
+			}
+		}
+	}
+	return nil
+}
+
+// IsUserAllowedAccessToExtClient - checks if user has permission to access extclient
+func IsUserAllowedAccessToExtClient(username string, client models.ExtClient) bool {
+	if username == MasterUser {
+		return true
+	}
+	user := &schema.User{Username: username}
+	err := user.Get(db.WithContext(context.TODO()))
+	if err != nil {
+		return false
+	}
+	if user.Username != client.OwnerID {
+		return false
+	}
+	return true
+}
+
+func ValidateInetGwReq(node *schema.Node, req models.InetNodeReq, update bool) error {
+	if node.Host.FirewallInUse == schema.FIREWALL_NONE {
+		return errors.New("iptables or nftables needs to be installed")
+	}
+	if node.IsIGWClient {
+		return fmt.Errorf("node %s is using a internet gateway already", node.Host.Name)
+	}
+	if node.RelayedByNodeID != nil {
+		return fmt.Errorf("node %s is being relayed", node.Host.Name)
+	}
+
+	for _, clientNodeID := range req.InetNodeClientIDs {
+		clientNode, err := GetNodeByID(clientNodeID)
+		if err != nil {
+			return err
+		}
+		if clientNode.IsAutoRelay {
+			return errors.New("failover node cannot be set to use internet gateway")
+		}
+		clientHost := &schema.Host{
+			ID: clientNode.HostID,
+		}
+		err = clientHost.Get(db.WithContext(context.TODO()))
+		if err != nil {
+			return err
+		}
+		if clientHost.IsDefault {
+			return errors.New("default host cannot be set to use internet gateway")
+		}
+		if clientNode.IsInternetGateway {
+			return fmt.Errorf("node %s acting as internet gateway cannot use another internet gateway", clientHost.Name)
+		}
+		if update {
+			if clientNode.InternetGwID != "" && clientNode.InternetGwID != node.ID {
+				return fmt.Errorf("node %s is already using a internet gateway", clientHost.Name)
+			}
+		} else {
+			if clientNode.InternetGwID != "" {
+				return fmt.Errorf("node %s is already using a internet gateway", clientHost.Name)
+			}
+		}
+		if len(clientNode.AutoRelayedPeers) > 0 {
+			ResetAutoRelayedPeer(&clientNode)
+		}
+
+		if clientNode.IsRelayed && clientNode.RelayedBy != node.ID {
+			return fmt.Errorf("node %s is being relayed", clientHost.Name)
+		}
+
+		for _, clientID := range clientHost.Nodes {
+			otherNode, err := GetNodeByID(clientID)
+			if err != nil {
+				continue
+			}
+			if otherNode.InternetGwID != "" && otherNode.InternetGwID != node.ID {
+				return errors.New("nodes on same host cannot use different internet gateway")
+			}
+		}
+	}
+	return nil
+}
+
+// SetInternetGw - sets the node as internet gw based on flag bool
+func SetInternetGw(node *models.Node, req models.InetNodeReq) {
+	node.IsInternetGateway = true
+	node.InetNodeReq = req
+	for _, clientNodeID := range req.InetNodeClientIDs {
+		clientNode, err := GetNodeByID(clientNodeID)
+		if err != nil {
+			continue
+		}
+		if clientNode.AutoAssignGateway {
+			clientNode.AutoAssignGateway = false
+			if clientNode.RelayedBy != "" && clientNode.RelayedBy != node.ID.String() {
+				currRelay, err := GetNodeByID(clientNode.RelayedBy)
+				if err == nil {
+					newRelayed := RemoveAllFromSlice(currRelay.RelayedNodes, clientNode.ID.String())
+					UpdateRelayNodes(currRelay.ID.String(), currRelay.RelayedNodes, newRelayed)
+				}
+				clientNode.RelayedBy = ""
+			}
+		}
+		clientNode.InternetGwID = node.ID.String()
+		UpsertNode(&clientNode)
+	}
+}
+
+func UnsetInternetGw(node *models.Node) {
+	nodes, err := GetNetworkNodes(node.Network)
+	if err != nil {
+		slog.Error("failed to get network nodes", "network", node.Network, "error", err)
+		return
+	}
+	for _, clientNode := range nodes {
+		if node.ID.String() == clientNode.InternetGwID {
+			clientNode.InternetGwID = ""
+			UpsertNode(&clientNode)
+		}
+
+	}
+	node.IsInternetGateway = false
+	node.InetNodeReq = models.InetNodeReq{}
+
+}
+
+func SetDefaultGwForRelayedUpdate(relayed, relay models.Node, peerUpdate models.HostPeerUpdate) models.HostPeerUpdate {
+	if relay.InternetGwID != "" {
+		relayedHost := &schema.Host{
+			ID: relayed.HostID,
+		}
+		err := relayedHost.Get(db.WithContext(context.TODO()))
+		if err != nil {
+			return peerUpdate
+		}
+		peerUpdate.ChangeDefaultGw = true
+		peerUpdate.DefaultGwIp = relay.Address.IP
+		if peerUpdate.DefaultGwIp == nil || relayedHost.EndpointIP == nil {
+			peerUpdate.DefaultGwIp = relay.Address6.IP
+		}
+
+	}
+	return peerUpdate
+}
+
+func SetDefaultGw(node models.Node, peerUpdate models.HostPeerUpdate) models.HostPeerUpdate {
+	if node.InternetGwID != "" {
+
+		inetNode, err := GetNodeByID(node.InternetGwID)
+		if err != nil {
+			return peerUpdate
+		}
+		host := &schema.Host{
+			ID: node.HostID,
+		}
+		err = host.Get(db.WithContext(context.TODO()))
+		if err != nil {
+			return peerUpdate
+		}
+
+		peerUpdate.ChangeDefaultGw = true
+		peerUpdate.DefaultGwIp = inetNode.Address.IP
+		if peerUpdate.DefaultGwIp == nil || host.EndpointIP == nil {
+			peerUpdate.DefaultGwIp = inetNode.Address6.IP
+		}
+	}
+	return peerUpdate
+}
+
+// GetAllowedIpForInetNodeClient - get inet cidr for node using a inet gw
+func GetAllowedIpForInetNodeClient(node, peer *models.Node) []net.IPNet {
+	var allowedips = []net.IPNet{}
+
+	if peer.Address.IP != nil {
+		_, ipnet, _ := net.ParseCIDR(IPv4Network)
+		allowedips = append(allowedips, *ipnet)
+	}
+
+	if peer.Address6.IP != nil {
+		_, ipnet, _ := net.ParseCIDR(IPv6Network)
+		allowedips = append(allowedips, *ipnet)
+	}
+
+	return allowedips
+}

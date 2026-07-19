@@ -1,0 +1,359 @@
+// -build ee
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime/debug"
+	"sync"
+	"syscall"
+
+	ch "github.com/gravitl/netmaker/clickhouse"
+	"github.com/gravitl/netmaker/db"
+	"github.com/gravitl/netmaker/orchestrator"
+	"github.com/gravitl/netmaker/orchestrator/extensions"
+	"github.com/gravitl/netmaker/schema"
+	"github.com/gravitl/netmaker/scope"
+	"gorm.io/gorm"
+
+	"github.com/google/uuid"
+	"github.com/gravitl/netmaker/config"
+	controller "github.com/gravitl/netmaker/controllers"
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/migrate"
+	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/mq"
+	"github.com/gravitl/netmaker/netclient/ncutils"
+	"github.com/gravitl/netmaker/servercfg"
+	_ "go.uber.org/automaxprocs"
+	"golang.org/x/crypto/nacl/box"
+	"golang.org/x/exp/slog"
+)
+
+var version = "v1.6.0"
+
+//	@title			NetMaker
+//	@version		1.6.0
+//	@description	NetMaker API Docs
+//	@tag.name	    APIUsage
+//	@tag.description.markdown
+//	@tag.name	    Authentication
+//	@tag.description.markdown
+//	@tag.name	    Pricing
+//	@tag.description.markdown
+//  @host      api.demo.netmaker.io
+
+// Start DB Connection and start API Request Handler
+func main() {
+	// Initializes repository with a CE extensions factory as the default. If built with 'ee' tag, the EE init()
+	// will have already registered the Pro factory and this call will be a no-op.
+	orchestrator.InitializeRepository(extensions.NewCEFactory())
+
+	absoluteConfigPath := flag.String("c", "", "absolute path to configuration file")
+	flag.Parse()
+	setVerbosity()
+	setupConfig(*absoluteConfigPath)
+	servercfg.SetVersion(version)
+	fmt.Println(models.RetrieveLogo()) // print the logo
+	initialize()                       // initial db and acls
+	setGarbageCollection()
+	defer db.CloseDB()
+
+	// TODO: although this doesn't cause any problem, it's not the best way to do this.
+	defer ch.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	var waitGroup sync.WaitGroup
+	startControllers(&waitGroup, ctx) // start the api endpoint and mq and stun
+	startHooks(ctx, &waitGroup)
+	<-ctx.Done()
+	waitGroup.Wait()
+}
+
+func setupConfig(absoluteConfigPath string) {
+	if len(absoluteConfigPath) > 0 {
+		cfg, err := config.ReadConfig(absoluteConfigPath)
+		if err != nil {
+			logger.Log(0, fmt.Sprintf("failed parsing config at: %s", absoluteConfigPath))
+			return
+		}
+		config.Config = cfg
+	}
+}
+
+func startHooks(ctx context.Context, wg *sync.WaitGroup) {
+	// Only run timer checkpoint (telemetry) on master pod
+	if servercfg.IsMasterPod() {
+		err := logic.TimerCheckpoint()
+		if err != nil {
+			logger.Log(1, "Timer error occurred: ", err.Error())
+		}
+	}
+	logic.EnterpriseCheck(ctx, wg)
+}
+
+func initialize() { // Client Mode Prereq Check
+	var err error
+
+	if servercfg.GetMasterKey() == "" {
+		logger.Log(0, "warning: MASTER_KEY not set, this could make account recovery difficult")
+	}
+
+	// Log master/worker mode for K8s HA setup
+	if servercfg.IsHA() {
+		if servercfg.IsMasterPod() {
+			logger.Log(0, "HA mode: running as MASTER pod - will run migrations and singleton operations")
+		} else {
+			logger.Log(0, "HA mode: running as WORKER pod - skipping migrations and singleton operations")
+		}
+	}
+
+	// initialize sql schema db.
+	err = db.InitializeDB(schema.ListModels()...)
+	if err != nil {
+		logger.FatalLog("error connecting to database: ", err.Error())
+	}
+
+	logger.Log(0, "database successfully connected")
+
+	// Only run migrations on master pod to avoid conflicts in HA setup
+	if servercfg.IsMasterPod() {
+		err = migrate.ToSQLSchema()
+		if err != nil {
+			// we shouldn't allow user to use the product until the migration is successfully done.
+			panic(err)
+		}
+		migrate.Run()
+
+		err = setServerID()
+		if err != nil {
+			logger.Log(0, "error setting server id: ", err.Error())
+		}
+
+		logic.SetJWTSecret()
+
+		err = setMqKeys()
+		if err != nil {
+			logger.Log(0, "error setting mq keys: ", err.Error())
+		}
+
+	}
+
+	//initialize cache
+	_, _ = logic.GetAllExtClients()
+	_ = logic.ListAcls()
+	_ = logic.CleanExpiredSSOStates()
+
+}
+
+func startControllers(wg *sync.WaitGroup, ctx context.Context) {
+	//Run Rest Server
+	if servercfg.IsRestBackend() {
+		if !servercfg.DisableRemoteIPCheck() && servercfg.GetAPIHost() == "127.0.0.1" {
+			err := servercfg.SetHost()
+			if err != nil {
+				logger.FatalLog("Unable to Set host. Exiting...", err.Error())
+			}
+		}
+		wg.Add(1)
+		go controller.HandleRESTRequests(wg, ctx)
+	}
+	//Run MessageQueue
+	if servercfg.IsMessageQueueBackend() {
+		brokerHost, _ := servercfg.GetMessageQueueEndpoint()
+		logger.Log(0, "connecting to mq broker at", brokerHost)
+		mq.SetupMQTT(true)
+		if mq.IsConnected() {
+			logger.Log(0, "connected to MQ Broker")
+		} else {
+			logger.FatalLog("error connecting to MQ Broker")
+		}
+
+		wg.Add(1)
+		go runMessageQueue(wg, ctx)
+	}
+
+	if !servercfg.IsRestBackend() && !servercfg.IsMessageQueueBackend() {
+		logger.Log(
+			0,
+			"No Server Mode selected, so nothing is being served! Set Rest mode (REST_BACKEND) or MessageQueue (MESSAGEQUEUE_BACKEND) to 'true'.",
+		)
+	}
+
+	wg.Add(1)
+	go logic.StartHookManager(ctx, wg)
+	// Only run network cleanup hooks on master pod
+	if servercfg.IsMasterPod() {
+		logic.InitNetworkHooks()
+	}
+	logic.AddSSOStateCleanupHook()
+}
+
+// Should we be using a context vice a waitgroup????????????
+func runMessageQueue(wg *sync.WaitGroup, ctx context.Context) {
+	defer wg.Done()
+	defer mq.CloseClient()
+
+	go mq.Keepalive(ctx)
+	go func() {
+		// Only run zombie management and expired node deletion on master pod
+		// to avoid duplicate operations in HA setup
+		if servercfg.IsMasterPod() {
+			go logic.ManageZombies(ctx)
+			go logic.DeleteExpiredNodes(ctx)
+			go logic.MarkStaleNodesOffline(ctx)
+		}
+		for nodeUpdate := range logic.DeleteNodesCh {
+			if nodeUpdate == nil {
+				continue
+			}
+			node := nodeUpdate
+			node.Action = schema.NODE_DELETE
+			node.PendingDelete = true
+			if err := mq.NodeUpdate(node); err != nil {
+				logger.Log(
+					0,
+					"failed to send peer update for deleted node: ",
+					node.ID.String(),
+					err.Error(),
+				)
+			}
+			if err := logic.DeleteNode(node, true); err != nil {
+				slog.Error(
+					"error deleting expired node",
+					"nodeid",
+					node.ID,
+					"error",
+					err.Error(),
+				)
+			}
+			go mq.PublishDeletedNodePeerUpdate(nil, node)
+		}
+	}()
+	<-ctx.Done()
+	logger.Log(0, "Message Queue shutting down")
+}
+
+func setVerbosity() {
+	verbose := int(servercfg.GetVerbosity())
+	logger.Verbosity = verbose
+	logLevel := &slog.LevelVar{}
+	replace := func(groups []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.SourceKey {
+			a.Value = slog.StringValue(filepath.Base(a.Value.String()))
+		}
+		return a
+	}
+	logger := slog.New(
+		slog.NewJSONHandler(
+			os.Stderr,
+			&slog.HandlerOptions{AddSource: true, ReplaceAttr: replace, Level: logLevel},
+		),
+	)
+	slog.SetDefault(logger)
+	switch verbose {
+	case 4:
+		logLevel.Set(slog.LevelDebug)
+	case 3:
+		logLevel.Set(slog.LevelInfo)
+	case 2:
+		logLevel.Set(slog.LevelWarn)
+	default:
+		logLevel.Set(slog.LevelError)
+	}
+}
+
+func setGarbageCollection() {
+	_, gcset := os.LookupEnv("GOGC")
+	if !gcset {
+		debug.SetGCPercent(ncutils.DEFAULT_GC_PERCENT)
+	}
+}
+
+func setServerID() error {
+	serverID := &schema.Internal{
+		Key: schema.InternalKey_ServerID,
+	}
+	err := serverID.Get(db.WithContext(context.TODO()))
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	if serverID.Value != "" {
+		return nil
+	}
+
+	serverID.Value = uuid.NewString()
+	ctx := db.WithContext(context.TODO())
+	if serverID.TenantID == "" {
+		serverID.TenantID = scope.ID(logic.DefaultScope(ctx))
+	}
+	return serverID.Set(ctx)
+}
+
+func setMqKeys() error {
+	mqPrivateKey := &schema.Internal{
+		Key: schema.InternalKey_MqPrivateKey,
+	}
+	err := mqPrivateKey.Get(db.WithContext(context.TODO()))
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	mqPublicKey := &schema.Internal{
+		Key: schema.InternalKey_MqPublicKey,
+	}
+	err = mqPublicKey.Get(db.WithContext(context.TODO()))
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	if mqPrivateKey.Value != "" && mqPublicKey.Value != "" {
+		return nil
+	}
+
+	publicKey, privateKey, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+
+	privateKeyBytes, err := ncutils.ConvertKeyToBytes(privateKey)
+	if err != nil {
+		return err
+	}
+
+	publicKeyBytes, err := ncutils.ConvertKeyToBytes(publicKey)
+	if err != nil {
+		return err
+	}
+
+	mqPrivateKey.Value = base64.StdEncoding.EncodeToString(privateKeyBytes)
+	mqPublicKey.Value = base64.StdEncoding.EncodeToString(publicKeyBytes)
+
+	ctx := db.WithContext(context.TODO())
+	if mqPrivateKey.TenantID == "" || mqPublicKey.TenantID == "" {
+		ctx := logic.DefaultScope(ctx)
+		if mqPrivateKey.TenantID == "" {
+			mqPrivateKey.TenantID = scope.ID(ctx)
+		}
+		if mqPublicKey.TenantID == "" {
+			mqPublicKey.TenantID = scope.ID(ctx)
+		}
+	}
+
+	err = mqPrivateKey.Set(ctx)
+	if err != nil {
+		return err
+	}
+
+	return mqPublicKey.Set(ctx)
+}

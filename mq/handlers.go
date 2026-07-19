@@ -1,0 +1,428 @@
+package mq
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/google/uuid"
+	"github.com/gravitl/netmaker/db"
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/netclient/ncutils"
+	"github.com/gravitl/netmaker/schema"
+	"github.com/gravitl/netmaker/servercfg"
+	"github.com/gravitl/netmaker/utils"
+	"golang.org/x/exp/slog"
+	"gorm.io/gorm"
+)
+
+// UpdateMetrics  message Handler -- handles updates from client nodes for metrics
+var UpdateMetrics = func(client mqtt.Client, msg mqtt.Message) {
+}
+
+var UpdateMetricsFallBack = func(nodeid string, newMetrics models.Metrics) {}
+
+// DefaultHandler default message queue handler  -- NOT USED
+func DefaultHandler(client mqtt.Client, msg mqtt.Message) {
+	slog.Info("mqtt default handler", "topic", msg.Topic(), "message", msg.Payload())
+}
+
+// UpdateNode  message Handler -- handles updates from client nodes
+func UpdateNode(client mqtt.Client, msg mqtt.Message) {
+	id, err := GetID(msg.Topic())
+	if err != nil {
+		slog.Error("error getting node.ID ", "topic", msg.Topic(), "error", err)
+		return
+	}
+	currentNode, err := logic.GetNodeByID(id)
+	if err != nil {
+		slog.Error("error getting node", "id", id, "error", err)
+		return
+	}
+	decrypted, decryptErr := DecryptMsg(&currentNode, msg.Payload())
+	if decryptErr != nil {
+		slog.Error("failed to decrypt message for node", "id", id, "error", decryptErr)
+		return
+	}
+	var newNode models.Node
+	if err := json.Unmarshal(decrypted, &newNode); err != nil {
+		slog.Error("error unmarshaling payload", "error", err)
+		return
+	}
+
+	ifaceDelta := logic.IfaceDelta(&currentNode, &newNode)
+	newNode.SetLastCheckIn()
+	if err := logic.UpdateNode(&currentNode, &newNode); err != nil {
+		slog.Error("error saving node", "id", id, "error", err)
+		return
+	}
+	if ifaceDelta { // reduce number of unneeded updates, by only sending on iface changes
+		if !newNode.Connected {
+			err = PublishDeletedNodePeerUpdate(nil, &newNode)
+			host := &schema.Host{ID: newNode.HostID}
+			if err := host.Get(db.WithContext(context.TODO())); err != nil {
+				slog.Error("failed to get host for the node", "nodeid", newNode.ID.String(), "error", err)
+				return
+			}
+			allNodes, err := logic.GetAllNodes()
+			if err == nil {
+				PublishSingleHostPeerUpdate(host, allNodes, nil, nil, nil, false, nil)
+			}
+		} else {
+			err = PublishPeerUpdate(false)
+		}
+		if err != nil {
+			slog.Warn("error updating peers when node informed the server of an interface change", "nodeid", currentNode.ID, "error", err)
+		}
+	}
+
+	slog.Info("updated node", "id", id, "newnodeid", newNode.ID)
+}
+
+// UpdateHost  message Handler -- handles host updates from clients
+func UpdateHost(client mqtt.Client, msg mqtt.Message) {
+	id, err := GetID(msg.Topic())
+	if err != nil {
+		slog.Error("error getting host.ID sent on ", "topic", msg.Topic(), "error", err)
+		return
+	}
+	currentHost := &schema.Host{ID: uuid.MustParse(id)}
+	if err := currentHost.Get(db.WithContext(context.TODO())); err != nil {
+		slog.Error("error getting host", "id", id, "error", err)
+		return
+	}
+	decrypted, decryptErr := decryptMsgWithHost(currentHost, msg.Payload())
+	if decryptErr != nil {
+		slog.Error("failed to decrypt message for host", "id", id, "name", currentHost.Name, "error", decryptErr)
+		return
+	}
+	var hostUpdate models.HostUpdate
+	if err := json.Unmarshal(decrypted, &hostUpdate); err != nil {
+		slog.Error("error unmarshaling payload", "error", err)
+		return
+	}
+	slog.Info("recieved host update", "name", hostUpdate.Host.Name, "id", hostUpdate.Host.ID)
+	var sendPeerUpdate bool
+	var replacePeers bool
+	switch hostUpdate.Action {
+	case models.CheckIn:
+		sendPeerUpdate = HandleHostCheckin(&hostUpdate.Host, currentHost)
+	case models.Acknowledgement:
+		nodes, err := logic.GetAllNodes()
+		if err != nil {
+			return
+		}
+		// send latest host update
+		HostUpdate(&models.HostUpdate{
+			Action: models.UpdateHost,
+			Host:   *currentHost})
+		PublishSingleHostPeerUpdate(currentHost, nodes, nil, nil, nil, false, nil)
+	case models.UpdateHost:
+		if hostUpdate.Host.PublicKey != currentHost.PublicKey {
+			//remove old peer entry
+			replacePeers = true
+		}
+		var endpointChanged bool
+		endpointChanged, sendPeerUpdate = logic.UpdateHostFromClient(&hostUpdate.Host, currentHost)
+		if endpointChanged {
+			logic.CheckHostPorts(currentHost)
+		}
+		err := logic.UpsertHost(currentHost)
+		if err != nil {
+			slog.Error("failed to update host", "id", currentHost.ID, "error", err)
+			return
+		}
+	case models.DeleteHost:
+		DeleteAndCleanupHost(currentHost)
+		sendPeerUpdate = true
+	case models.SignalHost:
+		SignalPeer(hostUpdate.Signal)
+
+	}
+
+	if sendPeerUpdate {
+		err := PublishPeerUpdate(replacePeers)
+		if err != nil {
+			slog.Error("failed to publish peer update", "error", err)
+		}
+	}
+}
+
+func DeleteAndCleanupHost(h *schema.Host) {
+	if servercfg.GetBrokerType() == servercfg.EmqxBrokerType {
+		// delete EMQX credentials for host
+		if err := emqx.DeleteEmqxUser(h.ID.String()); err != nil {
+			slog.Error("failed to remove host credentials from EMQX", "id", h.ID, "error", err)
+		}
+	}
+
+	// notify of deleted peer change
+
+	for _, nodeID := range h.Nodes {
+		node, err := logic.GetNodeByID(nodeID)
+		if err == nil {
+			PublishMqUpdatesForDeletedNode(h, node, false)
+		}
+	}
+
+	if err := logic.DisassociateAllNodesFromHost(h.ID.String()); err != nil {
+		slog.Error("failed to delete all nodes of host", "id", h.ID, "error", err)
+		return
+	}
+	if err := (&schema.Host{ID: h.ID}).Delete(db.WithContext(context.TODO())); err != nil {
+		slog.Error("failed to delete host", "id", h.ID, "error", err)
+		return
+	}
+}
+
+func SignalPeer(signal models.Signal) {
+
+	if signal.ToHostPubKey == "" {
+		msg := "insufficient data to signal peer"
+		logger.Log(0, msg)
+		return
+	}
+	node, err := logic.GetNodeByID(signal.FromNodeID)
+	if err != nil {
+		return
+	}
+	peer, err := logic.GetNodeByID(signal.ToNodeID)
+	if err != nil {
+		return
+	}
+	if node.Network != peer.Network {
+		return
+	}
+	signal.NetworkID = node.Network
+	signal.IsPro = servercfg.IsPro
+	peerHost := &schema.Host{ID: uuid.MustParse(signal.ToHostID)}
+	if err := peerHost.Get(db.WithContext(context.TODO())); err != nil {
+		slog.Error("failed to signal, peer host not found", "error", err)
+		return
+	}
+
+	err = HostUpdate(&models.HostUpdate{
+		Action: models.SignalHost,
+		Host:   *peerHost,
+		Signal: signal,
+	})
+	if err != nil {
+		slog.Error("failed to publish signal to peer", "error", err)
+	}
+}
+
+// ClientPeerUpdate  message handler -- handles updating peers after signal from client nodes
+func ClientPeerUpdate(client mqtt.Client, msg mqtt.Message) {
+	id, err := GetID(msg.Topic())
+	if err != nil {
+		slog.Error("error getting node.ID sent on ", "topic", msg.Topic(), "error", err)
+		return
+	}
+	currentNode, err := logic.GetNodeByID(id)
+	if err != nil {
+		slog.Error("error getting node", "id", id, "error", err)
+		return
+	}
+	decrypted, decryptErr := DecryptMsg(&currentNode, msg.Payload())
+	if decryptErr != nil {
+		slog.Error("failed to decrypt message for node", "id", id, "error", decryptErr)
+		return
+	}
+	switch decrypted[0] {
+	case ncutils.ACK:
+		// do we still need this
+	case ncutils.DONE:
+		if err = PublishPeerUpdate(false); err != nil {
+			slog.Error("error publishing peer update for node", "id", currentNode.ID, "error", err)
+			return
+		}
+	}
+
+	slog.Info("sent peer updates after signal received from", "id", id)
+}
+
+func HandleHostCheckin(h, currentHost *schema.Host) bool {
+	if h == nil {
+		return false
+	}
+
+	for i := range currentHost.Nodes {
+		currNodeID := currentHost.Nodes[i]
+		node, err := logic.GetNodeByID(currNodeID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				fakeNode := models.Node{}
+				fakeNode.ID, _ = uuid.Parse(currNodeID)
+				fakeNode.Action = schema.NODE_DELETE
+				fakeNode.PendingDelete = true
+				if err := NodeUpdate(&fakeNode); err != nil {
+					slog.Warn("failed to inform host to remove node", "host", currentHost.Name, "hostid", currentHost.ID, "nodeid", currNodeID, "error", err)
+				}
+			}
+			continue
+		}
+		wasOffline := node.Status == schema.OfflineSt ||
+			(node.Connected && time.Since(node.LastCheckIn) > models.LastCheckInThreshold)
+		if err := logic.UpdateNodeCheckin(node.ID.String()); err != nil {
+			slog.Warn("failed to update node on checkin", "nodeid", node.ID, "error", err)
+			continue
+		}
+		if wasOffline {
+			if node.Status == schema.OfflineSt {
+				promoted := &schema.Node{
+					ID:     node.ID.String(),
+					Status: schema.OnlineSt,
+				}
+				if err := promoted.UpdateStatus(db.WithContext(context.TODO())); err != nil {
+					slog.Warn("failed to promote node from offline on checkin", "nodeid", node.ID, "error", err)
+				}
+			}
+			go logic.TriggerCollectMetrics(currentHost.ID.String(), node.ID.String(), "checkin_recovered")
+		}
+	}
+
+	for i := range h.Interfaces {
+		h.Interfaces[i].AddressString = h.Interfaces[i].Address.String()
+	}
+	for i := range currentHost.Interfaces {
+		currentHost.Interfaces[i].AddressString = currentHost.Interfaces[i].Address.String()
+	}
+	utils.SortIfacesByName(h.Interfaces)
+	utils.SortIfacesByName(currentHost.Interfaces)
+	ifacesChanged := len(h.Interfaces) != len(currentHost.Interfaces) ||
+		!logic.CompareIfaceSlices(h.Interfaces, currentHost.Interfaces)
+
+	/// version or firewall in use change does not require a peerUpdate
+	if h.Version != currentHost.Version || h.FirewallInUse != currentHost.FirewallInUse || ifacesChanged {
+		currentHost.FirewallInUse = h.FirewallInUse
+		currentHost.Version = h.Version
+		currentHost.Interfaces = h.Interfaces
+		if err := logic.UpsertHost(currentHost); err != nil {
+			slog.Error("failed to update host after check-in", "name", h.Name, "id", h.ID, "error", err)
+			return false
+		}
+	}
+	if h.Location == "" || h.CountryCode == "" {
+		var nodeIP net.IP
+		if h.EndpointIP != nil {
+			nodeIP = h.EndpointIP
+		} else if h.EndpointIPv6 != nil {
+			nodeIP = h.EndpointIPv6
+		}
+
+		if nodeIP != nil {
+			info, err := utils.GetGeoInfo(nodeIP)
+			if err == nil {
+				h.Location = info.Location
+				h.CountryCode = info.CountryCode
+			}
+		}
+	}
+	var ifaceDeltaReasons []string
+	if !currentHost.IsStatic {
+		if !h.EndpointIP.Equal(currentHost.EndpointIP) {
+			ifaceDeltaReasons = append(ifaceDeltaReasons, "endpoint_ip")
+		}
+		if !h.EndpointIPv6.Equal(currentHost.EndpointIPv6) {
+			ifaceDeltaReasons = append(ifaceDeltaReasons, "endpoint_ipv6")
+		}
+	}
+	if len(h.NatType) > 0 && h.NatType != currentHost.NatType {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "nat_type")
+	}
+	if h.DefaultInterface != currentHost.DefaultInterface {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "default_interface")
+	}
+	if !currentHost.IsStaticPort {
+		if h.ListenPort != 0 && h.ListenPort != currentHost.ListenPort {
+			ifaceDeltaReasons = append(ifaceDeltaReasons, "listen_port")
+		}
+		if h.WgPublicListenPort != 0 && h.WgPublicListenPort != currentHost.WgPublicListenPort {
+			ifaceDeltaReasons = append(ifaceDeltaReasons, "wg_public_listen_port")
+		}
+	}
+
+	if h.OSFamily != currentHost.OSFamily {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "os_family")
+	}
+	if h.OSVersion != currentHost.OSVersion {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "os_version")
+	}
+	if h.KernelVersion != currentHost.KernelVersion {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "kernel_version")
+	}
+	if h.Location != currentHost.Location {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "location")
+	}
+	if h.CountryCode != currentHost.CountryCode {
+		ifaceDeltaReasons = append(ifaceDeltaReasons, "country_code")
+	}
+	ifaceDelta := len(ifaceDeltaReasons) > 0
+	if ifaceDelta { // only save if something changes
+		slog.Debug("host check-in peer-relevant delta",
+			"host", h.Name,
+			"id", h.ID,
+			"reasons", ifaceDeltaReasons,
+		)
+		if !currentHost.IsStatic {
+			currentHost.EndpointIP = h.EndpointIP
+			currentHost.EndpointIPv6 = h.EndpointIPv6
+		}
+		currentHost.DefaultInterface = h.DefaultInterface
+		currentHost.NatType = h.NatType
+		currentHost.OSFamily = h.OSFamily
+		currentHost.OSVersion = h.OSVersion
+		currentHost.KernelVersion = h.KernelVersion
+		if h.Location != "" {
+			currentHost.Location = h.Location
+		}
+		if h.CountryCode != "" {
+			currentHost.CountryCode = h.CountryCode
+		}
+		if !currentHost.IsStaticPort {
+			if h.ListenPort != 0 {
+				currentHost.ListenPort = h.ListenPort
+			}
+			if h.WgPublicListenPort != 0 {
+				currentHost.WgPublicListenPort = h.WgPublicListenPort
+			}
+		}
+
+		if err := logic.UpsertHost(currentHost); err != nil {
+			slog.Error("failed to update host after check-in", "name", h.Name, "id", h.ID, "error", err)
+			return false
+		}
+		slog.Info("updated host after check-in", "name", currentHost.Name, "id", currentHost.ID)
+	}
+
+	// Persist MDM device-matching identifiers if the netclient reported any
+	// new values. These don't affect peers, so don't roll into ifaceDelta.
+	mdmChanged := false
+	if h.EntraDeviceID != "" && h.EntraDeviceID != currentHost.EntraDeviceID {
+		currentHost.EntraDeviceID = h.EntraDeviceID
+		mdmChanged = true
+	}
+	if h.SerialNumber != "" && h.SerialNumber != currentHost.SerialNumber {
+		currentHost.SerialNumber = h.SerialNumber
+		mdmChanged = true
+	}
+	if h.HardwareUUID != "" && h.HardwareUUID != currentHost.HardwareUUID {
+		currentHost.HardwareUUID = h.HardwareUUID
+		mdmChanged = true
+	}
+	if mdmChanged {
+		if err := logic.UpsertHost(currentHost); err != nil {
+			slog.Error("failed to update mdm identifiers after check-in", "name", h.Name, "id", h.ID, "error", err)
+		}
+	}
+
+	slog.Info("check-in processed for host", "name", h.Name, "id", h.ID)
+	return ifaceDelta
+}
+
+var HandleExporterIntegrationPull = func(client mqtt.Client, msg mqtt.Message) {}

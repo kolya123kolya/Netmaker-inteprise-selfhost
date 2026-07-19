@@ -1,0 +1,288 @@
+//go:build ee
+// +build ee
+
+package pro
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	ch "github.com/gravitl/netmaker/clickhouse"
+	controller "github.com/gravitl/netmaker/controllers"
+	"github.com/gravitl/netmaker/db"
+	"github.com/gravitl/netmaker/logger"
+	"github.com/gravitl/netmaker/logic"
+	"github.com/gravitl/netmaker/models"
+	"github.com/gravitl/netmaker/mq"
+	"github.com/gravitl/netmaker/orchestrator"
+	"github.com/gravitl/netmaker/pro/auth"
+	proControllers "github.com/gravitl/netmaker/pro/controllers"
+	"github.com/gravitl/netmaker/pro/email"
+	"github.com/gravitl/netmaker/pro/license"
+	proLogic "github.com/gravitl/netmaker/pro/logic"
+	// Blank-import MDM provider packages so their init() registers with
+	// the integration/mdm registry. Add new providers by appending another import.
+	mdmpkg "github.com/gravitl/netmaker/pro/integration/mdm"
+	edrpkg "github.com/gravitl/netmaker/pro/integration/edr"
+	_ "github.com/gravitl/netmaker/pro/integration/mdm/intune"
+	_ "github.com/gravitl/netmaker/pro/integration/mdm/iru"
+	_ "github.com/gravitl/netmaker/pro/integration/mdm/jamf"
+	_ "github.com/gravitl/netmaker/pro/integration/mdm/jumpcloud"
+	_ "github.com/gravitl/netmaker/pro/integration/edr/crowdstrike"
+	_ "github.com/gravitl/netmaker/pro/integration/edr/defender"
+	_ "github.com/gravitl/netmaker/pro/integration/edr/sentinelone"
+	_ "github.com/gravitl/netmaker/pro/integration/edr/wazuh"
+	"github.com/gravitl/netmaker/pro/orchestrator/extensions"
+	"github.com/gravitl/netmaker/schema"
+	"github.com/gravitl/netmaker/servercfg"
+	"golang.org/x/exp/slog"
+)
+
+// InitPro - Initialize Pro Logic
+func InitPro() {
+	servercfg.IsPro = true
+	orchestrator.InitializeRepository(extensions.NewProFactory())
+	models.SetLogo(retrieveProLogo())
+	controller.HttpMiddlewares = append(
+		controller.HttpMiddlewares,
+		// TODO: try to add clickhouse middleware only if needed.
+		ch.Middleware,
+		proControllers.OnlyServerAPIWhenUnlicensedMiddleware,
+	)
+	controller.HttpHandlers = append(
+		controller.HttpHandlers,
+		proControllers.MetricHandlers,
+		proControllers.UserHandlers,
+		proControllers.RacHandlers,
+		proControllers.EventHandlers,
+		proControllers.TagHandlers,
+		proControllers.NetworkHandlers,
+		proControllers.AutoRelayHandlers,
+		// TODO: try to add flow handler only if flow logs are enabled.
+		proControllers.FlowHandlers,
+		proControllers.PostureCheckHandlers,
+		proControllers.JITHandlers,
+		proControllers.ServerHandlers,
+		proControllers.IntegrationHandlers,
+	)
+	controller.ListRoles = proControllers.ListRoles
+	logic.EnterpriseCheckFuncs = append(logic.EnterpriseCheckFuncs, func(ctx context.Context, wg *sync.WaitGroup) {
+		logger.Log(0, "starting license checker")
+		_ = license.ClearLicenseCache()
+		if err := license.ValidateLicense(); err != nil {
+			slog.Error(err.Error())
+			return
+		}
+		logger.Log(0, "proceeding with Paid Tier license")
+		// == End License Handling ==
+		// License validation runs on all pods to avoid audit issues
+		license.AddLicenseHooks()
+
+		//AddUnauthorisedUserNodeHooks()
+
+		var authProvider = auth.InitializeAuthProvider()
+		if authProvider != "" {
+			slog.Info("OAuth provider,", authProvider+",", "initialized")
+		} else {
+			slog.Error("no OAuth provider found or not configured, continuing without OAuth")
+		}
+		proLogic.LoadNodeMetricsToCache()
+		if servercfg.CacheEnabled() {
+			proLogic.InitAutoRelayCache()
+		}
+
+		// Only run singleton operations on master pod in HA setup
+		// These include IDP sync, posture checks, JIT expiry, and flow cleanup
+		if servercfg.IsMasterPod() {
+			auth.ResetIDPSyncHook()
+			proLogic.AddPostureCheckHook()
+			// Register JIT expiry hook with email notifications
+			addJitExpiryHookWithEmail()
+
+			if proLogic.GetFeatureFlags().EnableFlowLogs && logic.GetServerSettings().EnableFlowLogs {
+				err := ch.Initialize()
+				if err != nil {
+					logger.Log(0, "error connecting to clickhouse:", err.Error())
+				}
+
+				proLogic.StartFlowCleanupLoop()
+
+				wg.Add(1)
+				go func(ctx context.Context, wg *sync.WaitGroup) {
+					<-ctx.Done()
+					proLogic.StopFlowCleanupLoop()
+					ch.Close()
+					wg.Done()
+				}(ctx, wg)
+			}
+		}
+
+		// These can run on all pods
+		email.Init()
+		go proLogic.EventWatcher()
+		logic.GetMetricsMonitor().Start()
+	})
+
+	logic.ResetAutoRelay = proLogic.ResetAutoRelay
+	logic.ResetAutoRelayedPeer = proLogic.ResetAutoRelayedPeer
+	logic.SetAutoRelay = proLogic.SetAutoRelay
+	logic.GetAutoRelayPeerIps = proLogic.GetAutoRelayPeerIps
+
+	logic.GetMetrics = proLogic.GetMetrics
+	logic.UpdateMetrics = proLogic.UpdateMetrics
+	logic.DeleteMetrics = proLogic.DeleteMetrics
+	logic.DeleteNodeMetricsFromPeers = proLogic.DeleteNodeMetricsFromPeers
+	logic.SetPeerMetricsDisconnected = proLogic.SetPeerMetricsDisconnected
+	logic.TriggerCollectMetrics = proLogic.PublishCollectMetrics
+	mq.UpdateMetrics = proLogic.MQUpdateMetrics
+	mq.UpdateMetricsFallBack = proLogic.MQUpdateMetricsFallBack
+	logic.GetFilteredNodesByUserAccess = proLogic.GetFilteredNodesByUserAccess
+
+	logic.DeleteRole = proLogic.DeleteRole
+	logic.NetworkPermissionsCheck = proLogic.NetworkPermissionsCheck
+	logic.GlobalPermissionsCheck = proLogic.GlobalPermissionsCheck
+	logic.DeleteNetworkRoles = proLogic.DeleteNetworkRoles
+	logic.CreateDefaultNetworkRolesAndGroups = proLogic.CreateDefaultNetworkRolesAndGroups
+	logic.FilterNetworksByRole = proLogic.FilterNetworksByRole
+	logic.IsGroupsValid = proLogic.IsGroupsValid
+
+	logic.InitialiseRoles = proLogic.UserRolesInit
+	logic.UpdateUserGwAccess = proLogic.UpdateUserGwAccess
+	logic.CreateDefaultUserPolicies = proLogic.CreateDefaultUserPolicies
+	logic.IntialiseGroups = proLogic.UserGroupsInit
+	logic.AddGlobalNetRolesToAdmins = proLogic.AddGlobalNetRolesToAdmins
+	logic.StripGroupsOnRoleDowngrade = proLogic.StripGroupsOnRoleDowngrade
+	logic.AddGlobalGroupOnRoleUpgrade = proLogic.AddGlobalGroupOnRoleUpgrade
+	logic.PlatformRoleRequiresGroupEnforcement = proLogic.PlatformRoleRequiresGroupEnforcement
+	logic.UserHasGlobalNetworksAdminMembership = proLogic.UserHasGlobalNetworksAdminMembership
+	logic.UserHasNetworkGroupAccess = proLogic.UserHasNetworkGroupAccess
+	logic.IsNetworkAdmin = proLogic.IsNetworkAdmin
+	logic.CanUserCreateNetwork = proLogic.CanUserCreateNetwork
+
+	logic.GetUserGroup = proLogic.GetUserGroup
+	logic.GetNodeStatus = proLogic.GetNodeStatus
+	logic.IsOAuthConfigured = auth.IsOAuthConfigured
+	logic.ResetAuthProvider = auth.ResetAuthProvider
+	logic.ResetIDPSyncHook = auth.ResetIDPSyncHook
+	logic.SyncFromIDP = auth.SyncFromIDP
+	logic.EmailInit = email.Init
+	logic.LogEvent = proLogic.LogEvent
+	logic.RemoveUserFromAclPolicy = proLogic.RemoveUserFromAclPolicy
+	logic.EnsureDefaultUserGroupNetworkPolicies = proLogic.EnsureDefaultUserGroupNetworkPolicies
+	logic.GetGroupNetworksMap = proLogic.GetGroupNetworksMap
+	logic.IsUserAllowedToCommunicate = proLogic.IsUserAllowedToCommunicate
+	logic.DeleteAllNetworkTags = proLogic.DeleteAllNetworkTags
+	logic.CreateDefaultTags = proLogic.CreateDefaultTags
+	logic.IsPeerAllowed = proLogic.IsPeerAllowed
+	logic.IsAclPolicyValid = proLogic.IsAclPolicyValid
+	logic.GetEgressUserRulesForNode = proLogic.GetEgressUserRulesForNode
+	logic.GetTagMapWithNodesByNetwork = proLogic.GetTagMapWithNodesByNetwork
+	logic.GetUserAclRulesForNode = proLogic.GetUserAclRulesForNode
+	logic.CheckIfAnyPolicyisUniDirectional = proLogic.CheckIfAnyPolicyisUniDirectional
+	logic.CleanupGwsMigration = proLogic.CleanupGwsMigration
+	logic.GetFwRulesForNodeAndPeerOnGw = proLogic.GetFwRulesForNodeAndPeerOnGw
+	logic.GetFwRulesForUserNodesOnGw = proLogic.GetFwRulesForUserNodesOnGw
+	logic.GetFeatureFlags = proLogic.GetFeatureFlags
+	logic.GetDeploymentMode = proLogic.GetDeploymentMode
+	logic.GetNameserversForHost = proLogic.GetNameserversForHost
+	logic.GetNameserversForNode = proLogic.GetNameserversForNode
+	logic.ValidateNameserverReq = proLogic.ValidateNameserverReq
+	logic.ValidateEgressReq = proLogic.ValidateEgressReq
+	logic.CheckPostureViolations = proLogic.CheckPostureViolations
+	logic.CheckPostureViolationsForHost = proLogic.CheckPostureViolationsForHost
+	logic.GetPostureCheckDeviceInfoByNode = proLogic.GetPostureCheckDeviceInfoByNode
+	logic.SyncHostMDMState = mdmpkg.SyncHostMDMState
+	logic.SyncHostEDRState = edrpkg.SyncHostEDRState
+	logic.CheckUIHostReadAccess = proLogic.CheckUIHostReadAccess
+	logic.StartFlowCleanupLoop = proLogic.StartFlowCleanupLoop
+	logic.StopFlowCleanupLoop = proLogic.StopFlowCleanupLoop
+	// Expose JIT functions
+	logic.CheckJITAccess = proLogic.CheckJITAccess
+	logic.UserSubjectToNetworkJIT = proLogic.UserSubjectToNetworkJIT
+	logic.AssignVirtualRangeToEgress = proLogic.AssignVirtualRangeToEgress
+	mq.HandleExporterIntegrationPull = proLogic.HandleExporterIntegrationPull
+}
+
+// addJitExpiryHookWithEmail - registers a hook that expires JIT grants and sends email notifications
+func addJitExpiryHookWithEmail() {
+	if !proLogic.GetFeatureFlags().EnableJIT {
+		return
+	}
+	// Register JIT grant expiry hook with email notifications - runs every 5 minutes
+	logic.HookManagerCh <- models.HookDetails{
+		ID:       "jit-expiry-hook",
+		Hook:     logic.WrapHook(expireJITGrantsWithEmail),
+		Interval: 5 * time.Minute,
+	}
+}
+
+// expireJITGrantsWithEmail - expires JIT grants and sends email notifications
+func expireJITGrantsWithEmail() error {
+	ctx := db.WithContext(context.Background())
+
+	// Get grants that are about to expire or just expired (within last 5 minutes)
+	// We check before expiring so we can send emails
+	grant := schema.JITGrant{}
+	allGrants, err := grant.ListExpired(ctx)
+	if err != nil {
+		slog.Warn("failed to list expired grants for email notification", "error", err)
+		// Continue with expiration even if listing fails
+	}
+
+	// Track grants that need email before we expire them
+	var grantsToEmail []struct {
+		Grant   *schema.JITGrant
+		Request *schema.JITRequest
+		Network *schema.Network
+	}
+
+	fiveMinutesAgo := time.Now().Add(-5 * time.Minute)
+	for _, expiredGrant := range allGrants {
+		// Only send email for grants that expired recently (within last 5 minutes)
+		if expiredGrant.ExpiresAt.After(fiveMinutesAgo) && expiredGrant.RequestID != "" {
+			request := schema.JITRequest{ID: expiredGrant.RequestID}
+			if err := request.Get(ctx); err == nil {
+				network := &schema.Network{Name: expiredGrant.NetworkID}
+				err = network.Get(db.WithContext(context.TODO()))
+				if err == nil {
+					grantsToEmail = append(grantsToEmail, struct {
+						Grant   *schema.JITGrant
+						Request *schema.JITRequest
+						Network *schema.Network
+					}{&expiredGrant, &request, network})
+				}
+			}
+		}
+	}
+
+	// First, expire the grants (this handles the business logic)
+	if err := proLogic.ExpireJITGrants(); err != nil {
+		return err
+	}
+
+	// Then, send email notifications for the grants we tracked
+	for _, item := range grantsToEmail {
+		if err := email.SendJITExpirationEmail(item.Grant, item.Request, item.Network, false, ""); err != nil {
+			slog.Warn("failed to send expiration email", "grant_id", item.Grant.ID, "user", item.Request.UserName, "error", err)
+		}
+	}
+
+	return nil
+}
+
+func retrieveProLogo() string {
+	return `              
+ __   __     ______     ______   __    __     ______     __  __     ______     ______    
+/\ "-.\ \   /\  ___\   /\__  _\ /\ "-./  \   /\  __ \   /\ \/ /    /\  ___\   /\  == \   
+\ \ \-.  \  \ \  __\   \/_/\ \/ \ \ \-./\ \  \ \  __ \  \ \  _"-.  \ \  __\   \ \  __<   
+ \ \_\\"\_\  \ \_____\    \ \_\  \ \_\ \ \_\  \ \_\ \_\  \ \_\ \_\  \ \_____\  \ \_\ \_\ 
+  \/_/ \/_/   \/_____/     \/_/   \/_/  \/_/   \/_/\/_/   \/_/\/_/   \/_____/   \/_/ /_/ 
+                                                                                         																							 
+                                   ___    ___   ____                        
+           ____  ____  ____       / _ \  / _ \ / __ \       ____  ____  ____
+          /___/ /___/ /___/      / ___/ / , _// /_/ /      /___/ /___/ /___/
+         /___/ /___/ /___/      /_/    /_/|_| \____/      /___/ /___/ /___/ 
+                                                                            
+`
+}
