@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gravitl/netmaker/db"
-	"github.com/gravitl/netmaker/mq"
 	proLogic "github.com/gravitl/netmaker/pro/logic"
 	"github.com/gravitl/netmaker/schema"
 	"github.com/gravitl/netmaker/scope"
