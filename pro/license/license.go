@@ -1,3 +1,4 @@
+
 package license
 
 import (
@@ -47,21 +48,14 @@ func AddLicenseHooks() {
 // if license is not valid, function should error
 func ValidateLicense() (err error) {
 	// ===== ВСТАВКА ДЛЯ ENTERPRISE (ТЕСТ) =====
-	proLogic.SetFeatureFlags(models.FeatureFlags{
-		EnableDeviceApproval:          true,
-		EnableOverlappingEgressRanges: true,
-		EnableSSO:                     true,
-		EnableMetrics:                 true,
-		EnablePostureChecks:           true,
-		EnableAuditLog:                true,
-		EnableMobileApps:              true,
-		EnableHighAvailability:        true,
-	})
 	proLogic.SetDeploymentMode("enterprise")
 	slog.Info("✅ Enterprise mode activated (test override)")
 	return nil
 	// ===== КОНЕЦ ВСТАВКИ =====
 
+	// Остальной код не выполняется, его можно удалить или закомментировать.
+	// Ниже оставлен оригинальный код для справки, но он недостижим.
+	/*
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("%w: %s", errValidation, err.Error())
@@ -153,6 +147,7 @@ func ValidateLicense() (err error) {
 
 	slog.Info("License validation succeeded!")
 	return nil
+	*/
 }
 
 // FetchApiServerKeys - fetches netmaker license keys for identification
@@ -303,7 +298,6 @@ func validateLicenseKey(encryptedData []byte, publicKey *[32]byte) ([]byte, bool
 		OnSuccess: func() {
 			defer validateResponse.Body.Close()
 
-			// if we received a 200, cache the response locally
 			if validateResponse.StatusCode == http.StatusOK {
 				validationResponse, err = io.ReadAll(validateResponse.Body)
 				if err != nil {
@@ -317,9 +311,6 @@ func validateLicenseKey(encryptedData []byte, publicKey *[32]byte) ([]byte, bool
 					slog.Warn("failed to cache response", "error", err)
 				}
 			} else {
-				// at this point the backend returned some undesired state
-
-				// inform failure via logs
 				body, _ := io.ReadAll(validateResponse.Body)
 				err = fmt.Errorf("could not validate license with validation backend (status={%d}, body={%s})",
 					validateResponse.StatusCode, string(body))
