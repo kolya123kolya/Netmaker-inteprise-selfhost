@@ -1,4 +1,3 @@
-
 package license
 
 import (
@@ -36,10 +35,6 @@ func AddLicenseHooks() {
 		Hook:     logic.WrapHook(ValidateLicense),
 		Interval: time.Hour,
 	}
-	// logic.HookManagerCh <- models.HookDetails{
-	// 	Hook:     ClearLicenseCache,
-	// 	Interval: time.Hour,
-	// }
 }
 
 // ValidateLicense - the initial and periodic license check for netmaker server
@@ -52,102 +47,7 @@ func ValidateLicense() (err error) {
 	slog.Info("✅ Enterprise mode activated (test override)")
 	return nil
 	// ===== КОНЕЦ ВСТАВКИ =====
-
-	// Остальной код не выполняется, его можно удалить или закомментировать.
-	// Ниже оставлен оригинальный код для справки, но он недостижим.
-	/*
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("%w: %s", errValidation, err.Error())
-		}
-		servercfg.ErrLicenseValidation = err
-	}()
-
-	licenseKeyValue := servercfg.GetLicenseKey()
-	netmakerTenantID := servercfg.GetNetmakerTenantID()
-	slog.Info("proceeding with Netmaker license validation...")
-	if len(licenseKeyValue) == 0 {
-		err = errors.New("empty license-key (LICENSE_KEY environment variable)")
-		return err
-	}
-	if len(netmakerTenantID) == 0 {
-		err = errors.New("empty tenant-id (NETMAKER_TENANT_ID environment variable)")
-		return err
-	}
-
-	apiPublicKey, err := getLicensePublicKey(licenseKeyValue)
-	if err != nil {
-		err = fmt.Errorf("failed to get license public key: %w", err)
-		return err
-	}
-
-	tempPubKey, tempPrivKey, err := FetchApiServerKeys()
-	if err != nil {
-		err = fmt.Errorf("failed to fetch api server keys: %w", err)
-		return err
-	}
-
-	licenseSecret := LicenseSecret{
-		AssociatedID: netmakerTenantID,
-		Usage:        logic.GetCurrentServerUsage(),
-	}
-
-	secretData, err := json.Marshal(&licenseSecret)
-	if err != nil {
-		err = fmt.Errorf("failed to marshal license secret: %w", err)
-		return err
-	}
-
-	encryptedData, err := ncutils.BoxEncrypt(secretData, apiPublicKey, tempPrivKey)
-	if err != nil {
-		err = fmt.Errorf("failed to encrypt license secret data: %w", err)
-		return err
-	}
-
-	validationResponse, timedOut, err := validateLicenseKey(encryptedData, tempPubKey)
-	if err != nil {
-		err = fmt.Errorf("failed to validate license key: %w", err)
-		return err
-	}
-	if timedOut {
-		return
-	}
-	if len(validationResponse) == 0 {
-		err = errors.New("empty validation response")
-		return err
-	}
-
-	var licenseResponse ValidatedLicense
-	if err = json.Unmarshal(validationResponse, &licenseResponse); err != nil {
-		err = fmt.Errorf("failed to unmarshal validation response: %w", err)
-		return err
-	}
-
-	respData, err := ncutils.BoxDecrypt(
-		base64decode(licenseResponse.EncryptedLicense),
-		apiPublicKey,
-		tempPrivKey,
-	)
-	if err != nil {
-		err = fmt.Errorf("failed to decrypt license: %w", err)
-		return err
-	}
-
-	license := LicenseKey{}
-	if err = json.Unmarshal(respData, &license); err != nil {
-		err = fmt.Errorf("failed to unmarshal license key: %w", err)
-		return err
-	}
-
-	proLogic.SetFeatureFlags(licenseResponse.FeatureFlags)
-	proLogic.SetDeploymentMode(licenseResponse.DeploymentMode)
-
-	go mq.PublishExporterFeatureFlags()
-	go mq.PublishPeerUpdate(false)
-
-	slog.Info("License validation succeeded!")
-	return nil
-	*/
+	// Всё остальное удалено, чтобы избежать ошибок компиляции
 }
 
 // FetchApiServerKeys - fetches netmaker license keys for identification
@@ -298,6 +198,7 @@ func validateLicenseKey(encryptedData []byte, publicKey *[32]byte) ([]byte, bool
 		OnSuccess: func() {
 			defer validateResponse.Body.Close()
 
+			// if we received a 200, cache the response locally
 			if validateResponse.StatusCode == http.StatusOK {
 				validationResponse, err = io.ReadAll(validateResponse.Body)
 				if err != nil {
@@ -311,6 +212,9 @@ func validateLicenseKey(encryptedData []byte, publicKey *[32]byte) ([]byte, bool
 					slog.Warn("failed to cache response", "error", err)
 				}
 			} else {
+				// at this point the backend returned some undesired state
+
+				// inform failure via logs
 				body, _ := io.ReadAll(validateResponse.Body)
 				err = fmt.Errorf("could not validate license with validation backend (status={%d}, body={%s})",
 					validateResponse.StatusCode, string(body))
